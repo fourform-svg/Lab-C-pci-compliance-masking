@@ -1,0 +1,87 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Lab C - Vault & Veil - Independent - PCI-DSS Compliance, Macie PII, RLS, Masking Views, Config Rules
+
+Parameters:
+  DBMasterPassword:
+    Type: String
+    NoEcho: true
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.medium
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties: {CidrBlock: 10.2.0.0/16, Tags: [{Key: Name, Value: lab-c-vpc}]}
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties: {VpcId: !Ref VPC, CidrBlock: 10.2.2.0/24, AvailabilityZone: !Select [0, !GetAZs '']}
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties: {VpcId: !Ref VPC, CidrBlock: 10.2.3.0/24, AvailabilityZone: !Select [1, !GetAZs '']}
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties: {DBSubnetGroupDescription: lab-c private, SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]}
+
+  KMSKey:
+    Type: AWS::KMS::Key
+    Properties: {Description: Lab C CMK, EnableKeyRotation: true, KeyPolicy: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {AWS: !Sub arn:aws:iam::${AWS::AccountId}:root}, Action: 'kms:*', Resource: '*'}]}}
+  KMSAlias:
+    Type: AWS::KMS::Alias
+    Properties: {AliasName: alias/rds/lab-c-secure, TargetKeyId: !Ref KMSKey}
+
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties: {GroupDescription: Lab C DB SG, VpcId: !Ref VPC, SecurityGroupIngress: [{IpProtocol: tcp, FromPort: 5432, ToPort: 5432, CidrIp: 10.2.0.0/16}]}
+
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    Properties:
+      Engine: aurora-postgresql
+      EngineVersion: '15.4'
+      MasterUsername: dbadmin
+      MasterUserPassword: !Ref DBMasterPassword
+      DatabaseName: labcdb
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VpcSecurityGroupIds: [!Ref DBSecurityGroup]
+      StorageEncrypted: true
+      KmsKeyId: !Ref KMSKey
+
+  AuroraInstance:
+    Type: AWS::RDS::DBInstance
+    Properties: {DBClusterIdentifier: !Ref AuroraCluster, DBInstanceClass: !Ref DBInstanceClass, Engine: aurora-postgresql, PubliclyAccessible: false}
+
+  SnapshotExportBucket:
+    Type: AWS::S3::Bucket
+    Properties: {BucketName: !Sub lab-c-snapshot-export-${AWS::AccountId}-${AWS::Region}}
+
+  MacieSession:
+    Type: AWS::Macie::Session
+    Properties: {FindingPublishingFrequency: FIFTEEN_MINUTES, Status: ENABLED}
+
+  ConfigRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: {Version: '2012-10-17', Statement: [{Effect: Allow, Principal: {Service: config.amazonaws.com}, Action: sts:AssumeRole}]}
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AWSConfigRole]
+
+  ConfigRecorder:
+    Type: AWS::Config::ConfigurationRecorder
+    Properties: {Name: lab-c-recorder, RoleARN: !GetAtt ConfigRole.Arn, RecordingGroup: {AllSupported: true}}
+
+  ConfigRuleEncrypted:
+    Type: AWS::Config::ConfigRule
+    Properties: {ConfigRuleName: lab-c-rds-storage-encrypted, Source: {Owner: AWS, SourceIdentifier: RDS_STORAGE_ENCRYPTED}}
+
+  ConfigRuleNoPublicSnapshot:
+    Type: AWS::Config::ConfigRule
+    Properties: {ConfigRuleName: lab-c-rds-snapshot-public-prohibited, Source: {Owner: AWS, SourceIdentifier: RDS_SNAPSHOTS_PUBLIC_PROHIBITED}}
+
+Outputs:
+  AuroraEndpoint:
+    Value: !GetAtt AuroraCluster.Endpoint
+    Description: Use with psql and run sql/rls_and_masking_views.sql
+  S3ExportBucket:
+    Value: !Ref SnapshotExportBucket
+  KMSKeyId:
+    Value: !Ref KMSKey
